@@ -120,9 +120,15 @@ describe('predictMatch', () => {
 
     const p = Object.fromEntries(result.outcomes.map((o) => [o.key, o.probability]))
     expect(p['home'] ?? 0).toBeGreaterThan(p['away'] ?? 1) // home advantage
-    // All three models had 10 games per side — none may abstain.
-    expect(result.modelOutputs).toHaveLength(3)
-    expect(result.modelOutputs.every((m) => !m.abstained)).toBe(true)
+    // The pool is four models. The three fitted models had 10 games per side
+    // and must participate; football.learned honestly abstains below its
+    // 120-training-game threshold on this small fixture.
+    expect(result.modelOutputs).toHaveLength(4)
+    const learned = result.modelOutputs.find((m) => m.modelId === 'football.learned')
+    expect(learned?.abstained).toBe(true)
+    expect(
+      result.modelOutputs.filter((m) => m.modelId !== 'football.learned').every((m) => !m.abstained),
+    ).toBe(true)
     // A symmetric all-draw league prices a heavy draw share.
     expect(p['draw'] ?? 0).toBeGreaterThan(0.25)
   })

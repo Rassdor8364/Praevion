@@ -25,6 +25,7 @@ export type Capability =
   | 'sports.playerStats'
   | 'sports.injuries'
   | 'sports.lineups'
+  | 'sports.odds'
   | 'news.latest'
   | 'news.search'
   | 'macro.series'
@@ -242,6 +243,45 @@ export interface SportsProvider extends Provider {
   getTeamGameStats(teamId: string, limit: number): Promise<ProviderResult<TeamGameStats[]>>
   getInjuries?(teamId: string): Promise<ProviderResult<Injury[]>>
   getLineups?(gameId: string): Promise<ProviderResult<Lineup[]>>
+}
+
+// ---------------------------------------------------------------------------
+// Sportsbook odds
+// ---------------------------------------------------------------------------
+
+export interface BookOddsOutcome {
+  /** Outcome name as the venue labels it (team name, 'Draw', 'Over', …). */
+  readonly name: string
+  readonly decimalOdds: number
+  /** Line for totals/handicaps ('Over 2.5' → 2.5); null for 1X2. */
+  readonly point: number | null
+}
+
+export interface BookMarketOdds {
+  readonly bookmaker: string
+  /** Provider-normalised market key: 'h2h' (1X2) or 'totals'. */
+  readonly marketKey: 'h2h' | 'totals'
+  readonly outcomes: readonly BookOddsOutcome[]
+  /** Epoch ms the venue last updated these prices. */
+  readonly lastUpdate: number
+}
+
+/**
+ * One event's odds as the odds venue describes it. Team naming and event ids
+ * are the VENUE'S, not ours — matching an odds event to a provider game is a
+ * separate, deliberately conservative step (engines/sports/odds-edge.ts):
+ * a wrong match would price one fixture with another's market.
+ */
+export interface GameOdds {
+  readonly externalId: string
+  readonly homeTeamName: string
+  readonly awayTeamName: string
+  readonly kickoff: number
+  readonly markets: readonly BookMarketOdds[]
+}
+
+export interface OddsProvider extends Provider {
+  getOdds(params: { competitionId: string }): Promise<ProviderResult<GameOdds[]>>
 }
 
 // ---------------------------------------------------------------------------

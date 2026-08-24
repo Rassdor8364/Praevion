@@ -15,6 +15,11 @@ import { Panel } from '@/ui/Panel'
 import { ProbabilityBar } from '@/ui/ProbabilityBar'
 import { RiskBadge } from '@/ui/RiskBadge'
 import { cn, formatPct, formatSignedPp } from '@/ui/lib'
+import {
+  DerivedMarketsPanel,
+  ScoreDistributionPanel,
+  SportsbookPanel,
+} from '@/ui/sports/BettingMarkets'
 import { AutoRefresh } from '../../AutoRefresh'
 import { Crest, SeasonNote, ThreeWaySplit, crestHref, formatKickoff, formatRelative, leadingKey } from '../../ui'
 
@@ -224,10 +229,14 @@ export default async function MatchPage({ params }: PageProps) {
     game,
     prediction,
     markets,
+    betMarkets,
     lambdas,
     fairOdds,
     comparison,
     confidenceBreakdown,
+    adaptiveWeights,
+    learnedTrainingSamples,
+    marketOdds,
     earlySeason,
     currentSeasonFinishedGames,
   } = result.value
@@ -354,6 +363,20 @@ export default async function MatchPage({ params }: PageProps) {
               </li>
             ))}
           </ul>
+          <p className="mt-3 border-t border-vx-border pt-2 text-[10px] leading-relaxed text-vx-caption">
+            {adaptiveWeights !== null ? (
+              <>
+                Weights include measured-performance adjustment from{' '}
+                <span className="vx-num text-[11px] text-vx-heading">{adaptiveWeights.totalSettled}</span>{' '}
+                settled predictions (shrunk, capped — see Model Lab).
+              </>
+            ) : (
+              <>Designed weights — no settled prediction history yet to adapt from.</>
+            )}{' '}
+            football.learned trained on{' '}
+            <span className="vx-num text-[11px] text-vx-heading">{learnedTrainingSamples}</span> league
+            games as of this request.
+          </p>
         </Panel>
       </div>
 
@@ -362,37 +385,32 @@ export default async function MatchPage({ params }: PageProps) {
         <ComparisonTable home={comparison.home} away={comparison.away} />
       </Panel>
 
-      {/* Secondary markets from the DC joint distribution */}
-      <Panel title="Goals Markets — Dixon–Coles">
-        {markets === null ? (
+      {/* Betting markets — the full coherent set from the DC joint distribution */}
+      {betMarkets === null || markets === null || lambdas === null ? (
+        <Panel title="Betting Markets">
           <ErrorState
             compact
             title="Unavailable"
-            message="The Dixon–Coles model abstained for this fixture, so no coherent goals distribution exists."
+            message="The Dixon–Coles model abstained for this fixture, so no coherent goals distribution exists to derive markets from."
           />
-        ) : (
-          <div className="grid grid-cols-1 gap-x-8 gap-y-3 sm:grid-cols-2">
-            <div className="space-y-2">
-              <ProbabilityBar value={markets.over25} label="Over 2.5" />
-              <ProbabilityBar value={markets.under25} label="Under 2.5" />
-            </div>
-            <div className="space-y-2">
-              <ProbabilityBar value={markets.bttsYes} label="BTTS Yes" />
-              <ProbabilityBar value={markets.bttsNo} label="BTTS No" />
-            </div>
+        </Panel>
+      ) : (
+        <>
+          <div className="grid grid-cols-1 gap-5 lg:grid-cols-2">
+            <ScoreDistributionPanel
+              markets={betMarkets}
+              homeName={game.homeTeamName}
+              awayName={game.awayTeamName}
+            />
+            <SportsbookPanel marketOdds={marketOdds} />
           </div>
-        )}
-        {lambdas !== null && (
-          <p className="mt-3 border-t border-vx-border pt-2 text-[10px] text-vx-caption">
-            Expected goals (fitted rates): {game.homeTeamName}{' '}
-            <span className="vx-num text-[11px] text-vx-heading">{lambdas.home.toFixed(2)}</span> ·{' '}
-            {game.awayTeamName}{' '}
-            <span className="vx-num text-[11px] text-vx-heading">{lambdas.away.toFixed(2)}</span>. These
-            come from the Dixon–Coles joint distribution alone, coherent with its 1X2 rather than the
-            pooled one.
-          </p>
-        )}
-      </Panel>
+          <DerivedMarketsPanel
+            markets={betMarkets}
+            homeName={game.homeTeamName}
+            awayName={game.awayTeamName}
+          />
+        </>
+      )}
 
       <DisclaimerFooter />
     </div>

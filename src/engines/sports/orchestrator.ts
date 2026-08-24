@@ -17,8 +17,12 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import { DAY_MS, HOUR_MS, isoNow, systemClock, type Clock } from '@/core/clock'
+import { DAY_MS, HOUR_MS, MINUTE_MS, isoNow, systemClock, type Clock } from '@/core/clock'
 import { err, ok, type Result } from '@/core/result'
+import {
+  computeAdaptiveWeights,
+  type ModelWeightRationale,
+} from '@/core/learning/adaptive-weights'
 import { buildPrediction } from '@/core/prediction/builder'
 import { computeConfidence } from '@/core/prediction/confidence'
 import type {
@@ -27,18 +31,43 @@ import type {
   VixeraPrediction,
 } from '@/core/prediction/types'
 import { computeDataQuality, type DatasetQuality } from '@/core/quality/data-quality'
+import { isServiceRoleConfigured } from '@/db/client'
+import {
+  getModelPerformance,
+  getUnsettled,
+  listResolvedPredictions,
+  recordPredictionHistory,
+  savePrediction,
+  settleOutcome,
+} from '@/db/repositories'
 import { getRegistry } from '@/providers'
 import { missingCapabilityMarker, type ProviderRegistry } from '@/providers/registry'
 import type {
   Capability,
   Game,
+  GameOdds,
+  OddsProvider,
   Provenance,
   SportsProvider,
   Team,
   TeamGameStats,
 } from '@/providers/types'
 import { ESPN_LEAGUES } from '@/providers/sports/espn'
+import { calibrationReport, type CalibrationReport } from '@/core/metrics/calibration'
+import type { WalkForwardResult } from '@/core/learning/walk-forward'
+import { deriveBetMarkets, type BetMarkets } from './bet-markets'
 import { MODEL_VERSION } from './config/football'
+import {
+  buildLearnedTrainingSet,
+  evaluateLearnedWalkForward,
+  LEARNED_MODEL_VERSION,
+} from './learned'
+import {
+  compareWithMarket,
+  matchGameToOdds,
+  type MatchMarketComparison,
+} from './odds-edge'
+import { actualKeyFromScore, gameIdFromSubject, leagueOfGameId } from './settlement'
 import { eloExpectedScore, fitElo, type EloTable, type FinishedGame } from './elo'
 import { formRawComposite, formScore, type FormScoreConfig, type VixeraFormScore } from './form'
 import {
@@ -347,11 +376,30 @@ export interface GamePrediction {
   readonly prediction: VixeraPrediction
   /** Dixon–Coles joint-distribution markets — null when the DC model abstained. */
   readonly markets: MatchMarkets | null
+  /** The FULL derived market set (totals ladder, DNB, double chance, correct
+   *  scores, Asian/European handicaps) — null when the DC model abstained.
+   *  All read off the same joint distribution, coherent by construction. */
+  readonly betMarkets: BetMarkets | null
   readonly lambdas: MatchPredictionResult['lambdas']
   /** Margin-free decimal odds per pooled outcome. */
   readonly fairOdds: Readonly<Record<string, number>>
   readonly comparison: { readonly home: TeamComparisonSide; readonly away: TeamComparisonSide }
   readonly confidenceBreakdown: MatchPredictionResult['confidenceBreakdown']
+  /** Training games available to football.learned for this league. */
+  readonly learnedTrainingSamples: number
+  /** Measured-performance ensemble weights in force, null before any history. */
+  readonly adaptiveWeights: AdaptiveWeightsState | null
+  /**
+   * Sportsbook comparison. 'unconfigured' = no odds provider key;
+   * 'unavailable' = provider errored; 'unmatched' = the fixture could not be
+   * matched to an odds event with the required conservatism. Only 'ok'
+   * carries numbers — every other status renders its honest empty state.
+   */
+  readonly marketOdds: {
+    readonly status: 'ok' | 'unconfigured' | 'unavailable' | 'unmatched'
+    readonly comparison: MatchMarketComparison | null
+    readonly detail: string | null
+  }
   readonly earlySeason: boolean
   readonly currentSeasonFinishedGames: number
 }
@@ -377,6 +425,14 @@ interface CacheEntry<T> {
 const datasetCache = new Map<string, CacheEntry<LeagueDataset>>()
 const teamsCache = new Map<string, CacheEntry<ReadonlyMap<string, Team>>>()
 const fixturesCache = new Map<string, CacheEntry<FixturesPayload>>()
+const oddsCache = new Map<string, CacheEntry<{ data: GameOdds[]; provenance: Provenance }>>()
+
+/**
+ * Odds TTL. The free odds tier is request-budgeted (~500/month), and a
+ * minutes-stale price is fine for an ANALYTICAL model-vs-market comparison —
+ * the collected-at timestamp is shown wherever the numbers are.
+ */
+const ODDS_TTL_MS = 15 * MINUTE_MS
 
 /**
  * Fixtures TTL. Short — a fixture list changes when games kick off, finish
@@ -392,6 +448,118 @@ export function resetSportsCaches(): void {
   datasetCache.clear()
   teamsCache.clear()
   fixturesCache.clear()
+  oddsCache.clear()
+  adaptiveWeightsCache = null
+  lastPersistBySubject.clear()
+  persistenceStats.saved = 0
+  persistenceStats.failed = 0
+  persistenceStats.throttled = 0
+  persistenceStats.lastError = null
+  persistenceStats.lastSavedAt = null
+}
+
+// ---------------------------------------------------------------------------
+// Prediction persistence + adaptive-weights state
+// ---------------------------------------------------------------------------
+
+export interface SportsPersistenceStats {
+  readonly saved: number
+  readonly failed: number
+  readonly throttled: number
+  readonly lastError: string | null
+  readonly lastSavedAt: string | null
+}
+
+/** Process-lifetime counters the health endpoint reports. Honest telemetry:
+ *  a persistence path that fails silently would make the learning loop
+ *  quietly dead, so every write outcome is counted somewhere visible. */
+const persistenceStats = {
+  saved: 0,
+  failed: 0,
+  throttled: 0,
+  lastError: null as string | null,
+  lastSavedAt: null as string | null,
+}
+
+export function getSportsPersistenceStats(): SportsPersistenceStats {
+  return { ...persistenceStats }
+}
+
+/**
+ * Per-subject persistence throttle. Predictions regenerate on every board
+ * view, and the natural key includes generated_at — without a throttle each
+ * page view would append a near-identical row. One snapshot per subject per
+ * interval preserves the probability time-series at a sane density; the
+ * pre-kickoff snapshot used for evaluation is whichever row was last
+ * persisted before kickoff, which this cadence always provides.
+ */
+const PERSIST_MIN_INTERVAL_MS = 30 * MINUTE_MS
+const lastPersistBySubject = new Map<string, number>()
+
+export interface AdaptiveWeightsState {
+  readonly weights: Readonly<Record<string, number>>
+  readonly rationale: readonly ModelWeightRationale[]
+  readonly totalSettled: number
+  readonly computedAt: string
+}
+
+const ADAPTIVE_WEIGHTS_TTL_MS = 30 * MINUTE_MS
+let adaptiveWeightsCache: {
+  promise: Promise<AdaptiveWeightsState | null>
+  expiresAt: number
+} | null = null
+
+export interface ModelLabReport {
+  readonly leagueId: string
+  readonly leagueName: string
+  /** Finished games in the fitted dataset window. */
+  readonly datasetGames: number
+  /** Training samples available to football.learned (after cold-start skips). */
+  readonly trainingSamples: number
+  readonly skippedColdStart: number
+  /** Chronological validation of the learned model vs the base-rate
+   *  benchmark on identical folds; null when history is too thin. */
+  readonly walkForward: {
+    readonly learned: WalkForwardResult
+    readonly baseRate: WalkForwardResult
+  } | null
+  /** Measured leaderboard from settled predictions; null before any settle. */
+  readonly settledPerformance: {
+    readonly totalSettled: number
+    readonly ensemble: import('@/db/repositories').ModelScoreRow | null
+    readonly perModel: readonly import('@/db/repositories').ModelScoreRow[]
+  } | null
+  readonly calibration: CalibrationReport | null
+  readonly adaptiveWeights: AdaptiveWeightsState | null
+  readonly persistence: SportsPersistenceStats
+  readonly databaseConfigured: boolean
+  readonly modelVersions: Readonly<Record<string, string>>
+  readonly provenance: Provenance
+  readonly generatedAt: string
+}
+
+export interface LearningStatus {
+  readonly databaseConfigured: boolean
+  readonly persistence: SportsPersistenceStats
+  /** Open (unresolved) sports predictions, capped at the 500-row scan. */
+  readonly unsettledCount: number | null
+  readonly settledTotal: number | null
+  readonly ensembleScore: import('@/db/repositories').ModelScoreRow | null
+  readonly adaptiveWeights: AdaptiveWeightsState | null
+  readonly recentResolved: readonly import('@/db/repositories').ResolvedPredictionRow[] | null
+  readonly modelVersions: Readonly<Record<string, string>>
+  readonly generatedAt: string
+}
+
+export interface SettlementReport {
+  /** Unsettled sports predictions inspected. */
+  readonly checked: number
+  readonly settled: number
+  /** Game not finished (or not yet visible in the dataset window). */
+  readonly pending: number
+  /** Malformed subject, unknown league, or a post-kickoff prediction. */
+  readonly skipped: number
+  readonly failures: readonly string[]
 }
 
 // ---------------------------------------------------------------------------
@@ -593,10 +761,18 @@ export class SportsIntelligenceOrchestrator {
     const currentSeasonFinishedGames =
       season === null ? 0 : dataset.games.filter((g) => g.season === season).length
 
+    const adaptive = await this.getAdaptiveWeights()
+
     const toPredict = fixtures.upcoming.filter((g) => g.status === 'scheduled').slice(0, predictLimit)
     const upcoming: FixturePrediction[] = []
     for (const game of toPredict) {
-      const p = this.buildFixturePrediction({ game, dataset, seasonStart, teamStats: null })
+      const p = this.buildFixturePrediction({
+        game,
+        dataset,
+        seasonStart,
+        teamStats: null,
+        modelWeights: adaptive?.weights ?? null,
+      })
       if (p !== null) {
         upcoming.push({ game, prediction: p.prediction, markets: p.markets, fairOdds: p.fairOdds })
       }
@@ -669,7 +845,14 @@ export class SportsIntelligenceOrchestrator {
         : null
 
     const seasonStart = seasonStartOf(game.season, [fixturesR.value.upcoming, dataset.games])
-    const built = this.buildFixturePrediction({ game, dataset, seasonStart, teamStats })
+    const adaptive = await this.getAdaptiveWeights()
+    const built = this.buildFixturePrediction({
+      game,
+      dataset,
+      seasonStart,
+      teamStats,
+      modelWeights: adaptive?.weights ?? null,
+    })
     if (built === null) {
       return err(new Error(`Prediction could not be produced for ${gameExternalId}`))
     }
@@ -685,10 +868,14 @@ export class SportsIntelligenceOrchestrator {
       game,
       prediction: built.prediction,
       markets: built.markets,
+      betMarkets: built.engine.matrix === null ? null : deriveBetMarkets(built.engine.matrix),
       lambdas: built.engine.lambdas,
       fairOdds: built.fairOdds,
       comparison,
       confidenceBreakdown: built.engine.confidenceBreakdown,
+      learnedTrainingSamples: built.engine.learnedTrainingSamples,
+      adaptiveWeights: adaptive,
+      marketOdds: await this.marketOddsFor(leagueId, game, built.prediction),
       earlySeason: currentSeasonFinishedGames < 30,
       currentSeasonFinishedGames,
     })
@@ -759,6 +946,367 @@ export class SportsIntelligenceOrchestrator {
     })
   }
 
+  // -- Sportsbook odds ---------------------------------------------------------
+
+  /** League odds, cached on the request-budget-friendly TTL. */
+  private async getLeagueOdds(
+    leagueId: string,
+  ): Promise<Result<{ data: GameOdds[]; provenance: Provenance }, Error>> {
+    const now = this.clock.now()
+    const cached = oddsCache.get(leagueId)
+    if (cached !== undefined && cached.expiresAt > now) return cached.promise
+
+    const promise = (async (): Promise<Result<{ data: GameOdds[]; provenance: Provenance }, Error>> => {
+      const fetched = await this.registry.resolve('sports.odds', (p) =>
+        (p as OddsProvider).getOdds({ competitionId: leagueId }),
+      )
+      if (!fetched.result.ok) return err(fetched.result.error)
+      return ok(fetched.result.value)
+    })()
+    oddsCache.set(leagueId, { promise, expiresAt: now + ODDS_TTL_MS })
+    const result = await promise
+    if (!result.ok) oddsCache.delete(leagueId) // never cache a failure
+    return result
+  }
+
+  /** Build the marketOdds block for one fixture — every failure mode maps to
+   *  a named status the UI renders honestly instead of a silent absence. */
+  private async marketOddsFor(
+    leagueId: string,
+    game: Game,
+    prediction: VixeraPrediction,
+  ): Promise<GamePrediction['marketOdds']> {
+    const oddsR = await this.getLeagueOdds(leagueId)
+    if (!oddsR.ok) {
+      const message = oddsR.error.message
+      const unconfigured =
+        message.includes('ODDS_API_KEY') || message.includes('No provider registered')
+      return {
+        status: unconfigured ? 'unconfigured' : 'unavailable',
+        comparison: null,
+        detail: message,
+      }
+    }
+
+    const matched = matchGameToOdds(game, oddsR.value.data)
+    if (matched === null) {
+      return {
+        status: 'unmatched',
+        comparison: null,
+        detail: 'No unambiguous odds event matched this fixture',
+      }
+    }
+
+    const comparison = compareWithMarket({
+      modelOutcomes: prediction.outcomes.map((o) => ({
+        key: o.key,
+        label: o.label,
+        probability: o.probability,
+      })),
+      odds: matched,
+    })
+    if (comparison === null) {
+      return {
+        status: 'unmatched',
+        comparison: null,
+        detail: 'The matched event carries no complete 1X2 quote',
+      }
+    }
+    return { status: 'ok', comparison, detail: null }
+  }
+
+  // -- Adaptive weights (the learning loop's output) --------------------------
+
+  /**
+   * Learned ensemble weights from MEASURED settled performance, or null when
+   * no database is configured or nothing has settled yet. Null means every
+   * model keeps its designed weight — the system without history behaves
+   * exactly like the system before this feature existed, which is the
+   * correct cold-start posture.
+   */
+  async getAdaptiveWeights(): Promise<AdaptiveWeightsState | null> {
+    if (!isServiceRoleConfigured()) return null
+    const now = this.clock.now()
+    const cached = adaptiveWeightsCache
+    if (cached !== null && cached.expiresAt > now) return cached.promise
+
+    const promise = (async (): Promise<AdaptiveWeightsState | null> => {
+      const perf = await getModelPerformance('sports', { limit: 500 })
+      if (!perf.ok || perf.value.totalSettled === 0) return null
+      const { weights, rationale } = computeAdaptiveWeights(perf.value.perModel)
+      return {
+        weights,
+        rationale,
+        totalSettled: perf.value.totalSettled,
+        computedAt: isoNow(this.clock),
+      }
+    })()
+    adaptiveWeightsCache = { promise, expiresAt: now + ADAPTIVE_WEIGHTS_TTL_MS }
+    const result = await promise
+    if (result === null) adaptiveWeightsCache = null // retry next call, not in 30min
+    return result
+  }
+
+  // -- Prediction persistence --------------------------------------------------
+
+  /**
+   * Persist a freshly generated pre-kickoff prediction, fire-and-forget.
+   *
+   * Deliberately NON-BLOCKING: a slow or absent database must never delay a
+   * prediction response — the write happens after the response is on its way
+   * and failures land in the stats counter rather than the request path.
+   * Only scheduled, pre-kickoff, non-demo predictions are written: §32's
+   * lock rule (the evaluated snapshot predates kickoff) is enforced at write
+   * time, which is the only place it can be enforced cheaply.
+   */
+  private maybePersist(game: Game, prediction: VixeraPrediction): void {
+    if (!isServiceRoleConfigured()) return
+    if (prediction.dataMode === 'demo') return
+    if (game.status !== 'scheduled') return
+    const now = this.clock.now()
+    if (game.kickoff <= now) return
+
+    const last = lastPersistBySubject.get(prediction.subject)
+    if (last !== undefined && now - last < PERSIST_MIN_INTERVAL_MS) {
+      persistenceStats.throttled += 1
+      return
+    }
+    lastPersistBySubject.set(prediction.subject, now)
+
+    void (async () => {
+      const saved = await savePrediction(prediction)
+      if (!saved.ok) {
+        persistenceStats.failed += 1
+        persistenceStats.lastError = saved.error.message
+        // Let the next attempt through — the throttle must not pin a failure.
+        lastPersistBySubject.delete(prediction.subject)
+        return
+      }
+      persistenceStats.saved += 1
+      persistenceStats.lastSavedAt = isoNow(this.clock)
+
+      const history = await recordPredictionHistory(
+        prediction.outcomes.map((o) => ({
+          predictionId: saved.value.id,
+          domain: prediction.domain,
+          subject: prediction.subject,
+          timeframe: prediction.timeframe,
+          outcomeKey: o.key,
+          probability: o.probability,
+          confidence: prediction.confidence,
+          dataQuality: prediction.dataQuality,
+          eventType: 'SCHEDULED' as const,
+          recordedAt: prediction.generatedAt,
+        })),
+      )
+      if (!history.ok) {
+        persistenceStats.lastError = history.error.message
+      }
+    })().catch((cause) => {
+      persistenceStats.failed += 1
+      persistenceStats.lastError = cause instanceof Error ? cause.message : String(cause)
+    })
+  }
+
+  // -- Settlement ---------------------------------------------------------------
+
+  /**
+   * Resolve every settleable sports prediction against verified final scores.
+   *
+   * Idempotent by construction: settleOutcome upserts on prediction_id, and
+   * getUnsettled only returns rows without an outcome link, so running this
+   * twice converges. Results come from the same provider datasets that feed
+   * predictions — fixtures (fresh, last 7 days) first, then the 420-day
+   * league dataset for stragglers. A game that is not finished yet simply
+   * stays pending; nothing here ever invents a result.
+   */
+  async settleFinishedGames(): Promise<Result<SettlementReport, Error>> {
+    if (!isServiceRoleConfigured()) {
+      return err(new Error('Settlement requires the service-role database configuration'))
+    }
+
+    const unsettled = await getUnsettled(500, { domain: 'sports' })
+    if (!unsettled.ok) return err(unsettled.error)
+
+    const failures: string[] = []
+    let settled = 0
+    let pending = 0
+    let skipped = 0
+
+    // Group by league so each league's game lookup is fetched once.
+    const byLeague = new Map<string, { row: (typeof unsettled.value)[number]; gameId: string }[]>()
+    for (const row of unsettled.value) {
+      const gameId = gameIdFromSubject(row.subject)
+      const leagueId = gameId === null ? null : leagueOfGameId(gameId)
+      if (gameId === null || leagueId === null || !(leagueId in ESPN_LEAGUES)) {
+        skipped += 1
+        continue
+      }
+      const list = byLeague.get(leagueId) ?? []
+      list.push({ row, gameId })
+      byLeague.set(leagueId, list)
+    }
+
+    for (const [leagueId, entries] of byLeague) {
+      // Fresh results first, long dataset as fallback for older games.
+      const gamesById = new Map<string, Game>()
+      const datasetR = await this.getLeagueDataset(leagueId)
+      if (datasetR.ok) {
+        for (const g of datasetR.value.games) gamesById.set(g.externalId, g)
+      }
+      const fixturesR = await this.getFixtures(leagueId)
+      if (fixturesR.ok) {
+        for (const g of fixturesR.value.results) gamesById.set(g.externalId, g)
+      }
+      if (!datasetR.ok && !fixturesR.ok) {
+        failures.push(`${leagueId}: ${datasetR.ok ? '' : datasetR.error.message}`)
+        pending += entries.length
+        continue
+      }
+
+      for (const { row, gameId } of entries) {
+        const game = gamesById.get(gameId)
+        if (
+          game === undefined ||
+          game.status !== 'finished' ||
+          game.homeScore === null ||
+          game.awayScore === null
+        ) {
+          pending += 1
+          continue
+        }
+        // The lock rule, re-checked at settlement: a prediction generated
+        // after kickoff is not a forecast and must never enter the accuracy
+        // record. The persist guard should make this unreachable; if it ever
+        // fires, skipping is the honest response.
+        if (Date.parse(row.generated_at) > game.kickoff) {
+          skipped += 1
+          continue
+        }
+        const key = actualKeyFromScore(game.homeScore, game.awayScore)
+        const outcome = await settleOutcome(row.id, key, {
+          settledBy: 'sports_settlement',
+          evidence: {
+            gameExternalId: gameId,
+            homeScore: game.homeScore,
+            awayScore: game.awayScore,
+            kickoff: new Date(game.kickoff).toISOString(),
+          },
+        })
+        if (outcome.ok) settled += 1
+        else failures.push(`${gameId}: ${outcome.error.message}`)
+      }
+    }
+
+    // Fresh results settled → the learned weights are stale by definition.
+    if (settled > 0) adaptiveWeightsCache = null
+
+    return ok({ checked: unsettled.value.length, settled, pending, skipped, failures })
+  }
+
+  // -- Model Lab ---------------------------------------------------------------
+
+  /**
+   * Everything the Model Lab shows, computed from real data at request time:
+   * walk-forward validation of the learned model on the league's own history
+   * (against a base-rate benchmark on identical folds), plus — when a
+   * database is configured and predictions have settled — the measured
+   * per-model leaderboard, calibration report and the adaptive weights in
+   * force. Sections that lack their data return null with the reason, and
+   * the UI renders the honest empty state.
+   */
+  async getModelLabReport(leagueId: string): Promise<Result<ModelLabReport, Error>> {
+    const datasetR = await this.getLeagueDataset(leagueId)
+    if (!datasetR.ok) return err(datasetR.error)
+    const dataset = datasetR.value
+    const now = this.clock.now()
+
+    const finished = toFinishedGames(dataset.games)
+    const trainingSet = buildLearnedTrainingSet(finished, now)
+    const walkForward = evaluateLearnedWalkForward(trainingSet.samples)
+
+    let settledPerformance: ModelLabReport['settledPerformance'] = null
+    let calibration: ModelLabReport['calibration'] = null
+    if (isServiceRoleConfigured()) {
+      const perf = await getModelPerformance('sports', { limit: 500 })
+      if (perf.ok && perf.value.totalSettled > 0) {
+        settledPerformance = {
+          totalSettled: perf.value.totalSettled,
+          ensemble: perf.value.ensemble,
+          perModel: perf.value.perModel,
+        }
+        calibration = calibrationReport(perf.value.calibration)
+      }
+    }
+
+    const adaptive = await this.getAdaptiveWeights()
+
+    return ok({
+      leagueId,
+      leagueName:
+        (ESPN_LEAGUES as Record<string, { name: string }>)[leagueId]?.name ?? leagueId,
+      datasetGames: dataset.games.length,
+      trainingSamples: trainingSet.samples.length,
+      skippedColdStart: trainingSet.skippedColdStart,
+      walkForward,
+      settledPerformance,
+      calibration,
+      adaptiveWeights: adaptive,
+      persistence: getSportsPersistenceStats(),
+      databaseConfigured: isServiceRoleConfigured(),
+      modelVersions: {
+        ensemble: MODEL_VERSION,
+        learned: LEARNED_MODEL_VERSION,
+      },
+      provenance: dataset.provenance,
+      generatedAt: isoNow(this.clock),
+    })
+  }
+
+  // -- Learning status -----------------------------------------------------------
+
+  /**
+   * The live state of the learning loop for the Learning dashboard. Every
+   * numeric field is measured; fields whose backing store is not configured
+   * come back null and the UI says so instead of showing a zero that would
+   * read as "we checked and there is nothing".
+   */
+  async getLearningStatus(): Promise<LearningStatus> {
+    const configured = isServiceRoleConfigured()
+    if (!configured) {
+      return {
+        databaseConfigured: false,
+        persistence: getSportsPersistenceStats(),
+        unsettledCount: null,
+        settledTotal: null,
+        ensembleScore: null,
+        adaptiveWeights: null,
+        recentResolved: null,
+        modelVersions: { ensemble: MODEL_VERSION, learned: LEARNED_MODEL_VERSION },
+        generatedAt: isoNow(this.clock),
+      }
+    }
+
+    const [unsettled, performance, resolved, adaptive] = await Promise.all([
+      getUnsettled(500, { domain: 'sports' }),
+      getModelPerformance('sports', { limit: 500 }),
+      listResolvedPredictions('sports', { limit: 10 }),
+      this.getAdaptiveWeights(),
+    ])
+
+    return {
+      databaseConfigured: true,
+      persistence: getSportsPersistenceStats(),
+      unsettledCount: unsettled.ok ? unsettled.value.length : null,
+      settledTotal: performance.ok ? performance.value.totalSettled : null,
+      ensembleScore: performance.ok ? performance.value.ensemble : null,
+      adaptiveWeights: adaptive,
+      recentResolved: resolved.ok ? resolved.value : null,
+      modelVersions: { ensemble: MODEL_VERSION, learned: LEARNED_MODEL_VERSION },
+      generatedAt: isoNow(this.clock),
+    }
+  }
+
   // -- Internals ---------------------------------------------------------------
 
   /**
@@ -782,6 +1330,8 @@ export class SportsIntelligenceOrchestrator {
       home: { data: TeamGameStats[]; provenance: Provenance }
       away: { data: TeamGameStats[]; provenance: Provenance }
     } | null
+    /** Learned ensemble weights from settled performance; null = designed weights. */
+    modelWeights?: Readonly<Record<string, number>> | null
   }): { prediction: VixeraPrediction; engine: MatchPredictionResult; markets: MatchMarkets | null; fairOdds: Readonly<Record<string, number>> } | null {
     const { game, dataset, seasonStart, teamStats } = params
     const now = this.clock.now()
@@ -803,6 +1353,7 @@ export class SportsIntelligenceOrchestrator {
         leagueGames: finished,
         asOf: now,
         seasonStart,
+        ...(params.modelWeights != null ? { config: { modelWeights: params.modelWeights } } : {}),
       })
     } catch {
       // A structural engine failure (not an abstention — those are handled
@@ -912,6 +1463,10 @@ export class SportsIntelligenceOrchestrator {
       modelVersion: engine.modelVersion,
       clock: this.clock,
     })
+
+    // The learning loop's first half: remember the forecast (pre-kickoff,
+    // non-demo, throttled — see maybePersist) so settlement can score it.
+    this.maybePersist(game, prediction)
 
     return { prediction, engine, markets: engine.markets, fairOdds: fairOddsFor(engine) }
   }

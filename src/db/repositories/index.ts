@@ -21,6 +21,16 @@ export {
 } from './predictions'
 
 export {
+  getModelPerformance,
+  listResolvedPredictions,
+  type CalibrationObservation,
+  type ModelPerformanceOptions,
+  type ModelPerformanceSummary,
+  type ModelScoreRow,
+  type ResolvedPredictionRow,
+} from './model-performance'
+
+export {
   upsertMarket,
   recordPrices,
   listMarkets,

@@ -39,6 +39,7 @@ import { PolymarketProvider } from './markets/polymarket'
 import type { PredictionMarketProvider } from './markets/types'
 import { DemoNewsProvider } from './news/demo'
 import { RssNewsProvider } from './news/rss'
+import { TheOddsApiProvider } from './odds/the-odds-api'
 import { ProviderRegistry } from './registry'
 import { DemoFootballProvider } from './sports/demo'
 import { EspnFootballProvider } from './sports/espn'
@@ -86,6 +87,14 @@ export function createRegistry(): ProviderRegistry {
   registry.register(new FootballDataProvider())
   registry.register(new EspnFootballProvider())
   registry.register(new DemoFootballProvider())
+
+  // --- Sportsbook odds -------------------------------------------------------
+  // Keyed; register() skips it without ODDS_API_KEY, leaving 'sports.odds'
+  // with no chain — consumers then render "Sportsbook odds unavailable".
+  // There is deliberately NO demo odds provider: a fabricated bookmaker
+  // price would flow into edge/EV numbers and defeat the product's honesty
+  // guarantee at its most sensitive point.
+  registry.register(new TheOddsApiProvider())
 
   // --- News ---------------------------------------------------------------
   registry.register(new RssNewsProvider())

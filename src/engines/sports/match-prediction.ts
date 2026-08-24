@@ -45,6 +45,8 @@ import {
   type EloConfig,
   type FinishedGame,
 } from './elo'
+import { runLearnedModel } from './learned'
+import type { LogisticModel } from '@/core/learning/logistic'
 import { formRawComposite, formScore, type FormScoreConfig, type VixeraFormScore } from './form'
 import {
   DEFAULT_RHO,
@@ -54,6 +56,7 @@ import {
   matrixToOutcomes,
   scoreMatrix,
   type AttackDefenceFit,
+  type PoissonScoreMatrix,
 } from './poisson'
 
 export const MATCH_OUTCOME_KEYS = ['home', 'draw', 'away'] as const
@@ -77,6 +80,14 @@ export interface MatchPredictionConfig {
   readonly h2hPriorWeight: number
   /** Hard ceiling on the H2H factor's contribution, in probability points. */
   readonly h2hContributionCap: number
+  /**
+   * Learned ensemble weights by modelId — the adaptive-intelligence seam.
+   * When present, a model's pool weight is multiplied by its entry (missing
+   * ids keep weight 1). The orchestrator computes these from MEASURED settled
+   * performance (core/learning/adaptive-weights); nothing inside the engine
+   * ever invents them. Abstaining models stay at weight 0 regardless.
+   */
+  readonly modelWeights?: Readonly<Record<string, number>>
 }
 
 export const DEFAULT_MATCH_PREDICTION_CONFIG: MatchPredictionConfig = {
@@ -142,6 +153,18 @@ export interface MatchPredictionResult {
   readonly markets: MatchMarkets | null
   /** Fitted expected goals per side, null when DC abstained. */
   readonly lambdas: { readonly home: number; readonly away: number } | null
+  /**
+   * The full Dixon–Coles joint score distribution, null when DC abstained.
+   * This is the substrate every derived betting market reads from
+   * (bet-markets.ts) — exposing the matrix rather than a fixed market list
+   * means new markets are a pure read-off, not a model change.
+   */
+  readonly matrix: PoissonScoreMatrix | null
+  /** The trained learned-model coefficients (Model Lab surface); null when
+   *  football.learned abstained. */
+  readonly learnedModel: LogisticModel | null
+  /** Training samples available to football.learned at this asOf. */
+  readonly learnedTrainingSamples: number
   readonly modelVersion: string
 }
 
@@ -315,8 +338,23 @@ export function predictMatch(params: MatchPredictionParams): MatchPredictionResu
   // Surfaced from the DC model closure for the result's secondary markets.
   let markets: MatchMarkets | null = null
   let lambdas: { home: number; away: number } | null = null
+  let dcMatrix: PoissonScoreMatrix | null = null
 
-  // --- The three models ------------------------------------------------------
+  // --- Model E: the trained statistical model --------------------------------
+  // Runs OUTSIDE runModel because it abstains internally (returning a proper
+  // abstention output) rather than throwing, and because its trained
+  // coefficients are surfaced in the result for the Model Lab.
+  const learned = runLearnedModel({
+    homeTeamId: params.homeTeamId,
+    awayTeamId: params.awayTeamId,
+    homeLabel,
+    awayLabel,
+    leagueGames: league,
+    asOf,
+    minPriorGames: cfg.minGames,
+  })
+
+  // --- The model pool --------------------------------------------------------
   const modelOutputs: ModelOutput[] = [
     runModel('football.dixon-coles', () => {
       if (dcFit === null) throw new InsufficientDataError('league games for the Dixon–Coles fit')
@@ -342,7 +380,8 @@ export function predictMatch(params: MatchPredictionParams): MatchPredictionResu
         dcFit.leagueAvg,
         1,
       )
-      const outcomes = matrixToOutcomes(scoreMatrix(lambdaHome, lambdaAway, cfg.rho, cfg.maxGoals))
+      dcMatrix = scoreMatrix(lambdaHome, lambdaAway, cfg.rho, cfg.maxGoals)
+      const outcomes = matrixToOutcomes(dcMatrix)
       markets = {
         over25: outcomes.over25,
         under25: outcomes.under25,
@@ -487,10 +526,28 @@ export function predictMatch(params: MatchPredictionParams): MatchPredictionResu
         ],
       })
     }),
+
+    learned.output,
   ]
 
+  // --- Learned ensemble weights (the adaptive seam) ---------------------------
+  // Multiplied, not replaced: a model's own emitted weight stays meaningful,
+  // and an id absent from the mapping keeps exactly the influence it had
+  // before any performance history existed. Guarded to non-negative finite
+  // values so a corrupted stored weight degrades to neutral, never to NaN.
+  const weighted =
+    cfg.modelWeights === undefined
+      ? modelOutputs
+      : modelOutputs.map((m) => {
+          const factor = cfg.modelWeights?.[m.modelId]
+          if (factor === undefined || !Number.isFinite(factor) || factor < 0 || m.abstained) {
+            return m
+          }
+          return { ...m, weight: m.weight * factor }
+        })
+
   // --- Pool -------------------------------------------------------------------
-  const ensemble = combineModels(modelOutputs, MATCH_OUTCOME_KEYS, {
+  const ensemble = combineModels(weighted, MATCH_OUTCOME_KEYS, {
     home: homeLabel,
     draw: 'Draw',
     away: awayLabel,
@@ -562,7 +619,7 @@ export function predictMatch(params: MatchPredictionParams): MatchPredictionResu
 
   return {
     outcomes: ensemble.outcomes,
-    modelOutputs,
+    modelOutputs: weighted,
     modelAgreement: ensemble.modelAgreement,
     effectiveModelCount: ensemble.effectiveModelCount,
     confidence: confidenceBreakdown.confidence,
@@ -573,6 +630,9 @@ export function predictMatch(params: MatchPredictionParams): MatchPredictionResu
     sampleSize,
     markets,
     lambdas,
+    matrix: dcMatrix,
+    learnedModel: learned.model,
+    learnedTrainingSamples: learned.trainingSamples,
     modelVersion: MODEL_VERSION,
   }
 }

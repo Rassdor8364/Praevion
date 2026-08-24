@@ -42,7 +42,17 @@ export const NAV_ITEMS: readonly NavItem[] = [
     ],
   },
   { href: '/crypto', label: 'Crypto Futures', icon: Bitcoin },
-  { href: '/sports', label: 'Sports', icon: Trophy },
+  {
+    href: '/sports',
+    label: 'Sports',
+    icon: Trophy,
+    children: [
+      { href: '/sports', label: 'Fixtures' },
+      { href: '/sports/model-lab', label: 'Model Lab' },
+      { href: '/sports/learning', label: 'Learning' },
+      { href: '/sports/history', label: 'History' },
+    ],
+  },
   { href: '/consensus', label: 'Consensus', icon: Users },
   { href: '/edge', label: 'Vixera Edge', icon: Zap },
   { href: '/news', label: 'News', icon: Newspaper },
