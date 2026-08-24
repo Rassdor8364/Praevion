@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64" fill="none">
+  <!-- PRAEVION favicon: mark on #0B0E14 rounded square. -->
+  <defs>
+    <linearGradient id="pv-ring" x1="8" y1="6" x2="44" y2="60" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#7C3AED"/>
+      <stop offset="0.22" stop-color="#7C3AED"/>
+      <stop offset="0.6" stop-color="#3B82FF"/>
+      <stop offset="1" stop-color="#00D4FF"/>
+    </linearGradient>
+    <linearGradient id="pv-metal" x1="24" y1="18" x2="40" y2="52" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="0.55" stop-color="#D4D4D8"/>
+      <stop offset="1" stop-color="#A1A1AA"/>
+    </linearGradient>
+    <linearGradient id="pv-edge" x1="23" y1="42" x2="32" y2="54" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#7C3AED"/>
+      <stop offset="1" stop-color="#3B82FF"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="14" fill="#0B0E14"/>
+  <g transform="translate(5.76, 5.76) scale(0.82)">
+    <path d="M40.62 12.67 A23 23 0 0 1 26.05 56.22" stroke="url(#pv-ring)" stroke-width="4.5"/>
+    <path d="M18.81 52.84 A23 23 0 0 1 23.38 12.67" stroke="url(#pv-ring)" stroke-width="4.5"/>
+    <path d="M32 3.6 L41 13.6 L32 10.3 L23 13.6 Z" fill="url(#pv-ring)"/>
+    <path d="M26 19 L31.5 19 L31.5 45 L22.6 54.2 Z M31.5 19 L40.5 22.5 L43 29 L38.5 34.5 L31.5 36.3 Z M31.5 24 L36.3 25.6 L37.6 28.8 L35.1 31.2 L31.5 31.9 Z" fill="url(#pv-metal)" fill-rule="evenodd"/>
+    <path d="M23.68 43 L31.5 43 L31.5 45 L22.6 54.2 Z" fill="url(#pv-edge)"/>
+  </g>
+</svg>

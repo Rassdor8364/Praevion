@@ -1,0 +1,39 @@
+/**
+ * Praevion — "Nocturno intelligence terminal" design tokens.
+ * Brand: PRAEVION by Vixera AI. See before it happens.
+ *
+ * Dark-only by design. Colour is used for STATE, never excitement:
+ * green/red appear ONLY for semantic direction (positive/negative),
+ * amber for degraded/partial states, cyan for live-data accents.
+ * Brand accents (violet/blue/cyan) are chrome/identity only — they never
+ * encode data semantics. Everything else is silver-slate hierarchy.
+ */
+
+:root {
+  /* Surfaces — brand palette */
+  --vx-bg: #0b0e14;
+  --vx-panel: #121826;
+  --vx-panel-glass: rgba(18, 24, 38, 0.62);
+  --vx-panel-raised: #1e293b;
+  --vx-border: rgba(30, 41, 59, 0.75);
+  --vx-border-strong: #1e293b;
+
+  /* Accents — PRAEVION brand */
+  --vx-accent: #7c3aed; /* violet — primary */
+  --vx-accent-2: #3b82ff; /* blue — secondary */
+  --vx-live: #00d4ff; /* cyan — highlight / live-data accents */
+
+  /* Text hierarchy */
+  --vx-heading: #ffffff;
+  --vx-body: #a1a1aa;
+  --vx-caption: #52525f;
+
+  /* Semantic direction ONLY */
+  --vx-pos: #34d399;
+  --vx-neg: #f87171;
+
+  /* State */
+  --vx-warn: #fbbf24; /* partial / degraded */
+
+  color-scheme: dark;
+}

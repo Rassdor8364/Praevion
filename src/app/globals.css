@@ -1,0 +1,65 @@
+@import "tailwindcss";
+@import "../ui/theme/tokens.css";
+
+@theme inline {
+  --color-vx-bg: var(--vx-bg);
+  --color-vx-panel: var(--vx-panel);
+  --color-vx-panel-raised: var(--vx-panel-raised);
+  --color-vx-border: var(--vx-border);
+  --color-vx-border-strong: var(--vx-border-strong);
+  --color-vx-accent: var(--vx-accent);
+  --color-vx-accent-2: var(--vx-accent-2);
+  --color-vx-live: var(--vx-live);
+  --color-vx-heading: var(--vx-heading);
+  --color-vx-body: var(--vx-body);
+  --color-vx-caption: var(--vx-caption);
+  --color-vx-pos: var(--vx-pos);
+  --color-vx-neg: var(--vx-neg);
+  --color-vx-warn: var(--vx-warn);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+html {
+  background: var(--vx-bg);
+}
+
+body {
+  background: var(--vx-bg);
+  color: var(--vx-body);
+  font-family: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+  line-height: 1.6;
+}
+
+/* Glass panel: translucent surface, 1px hairline border, restrained blur.
+   The glow is a barely-there inner sheen — never a decorative gradient. */
+.vx-glass {
+  background: var(--vx-panel-glass);
+  border: 1px solid var(--vx-border);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  box-shadow: inset 0 1px 0 rgba(148, 163, 184, 0.04);
+  border-radius: 0.5rem;
+}
+
+/* Monospaced numerals wherever data appears. */
+.vx-num {
+  font-family: var(--font-geist-mono), ui-monospace, monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Thin 1px separators. */
+.vx-sep {
+  border-color: var(--vx-border);
+}
+
+::selection {
+  background: rgba(124, 58, 237, 0.32);
+  color: var(--vx-heading);
+}
+
+/* Restrained scrollbars for a terminal feel. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(148, 163, 184, 0.18) transparent;
+}
